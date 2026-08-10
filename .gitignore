@@ -1,0 +1,15 @@
+## Ignore build outputs / IDE junk
+bin/
+obj/
+App/
+*.user
+*.suo
+.vs/
+_icotool/
+_frames/
+_buildcheck/
+
+## Do not commit secrets / local auth
+**/user-settings.json
+**/LOGIN_FAILED_ALERT.txt
+**/last-error.txt

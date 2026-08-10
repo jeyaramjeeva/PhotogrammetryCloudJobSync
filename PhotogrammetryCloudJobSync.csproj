@@ -1,0 +1,113 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>PhotogrammetryCloudJobSync</RootNamespace>
+    <AssemblyName>PhotogrammetryCloudJobSync</AssemblyName>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Product>Photogrammetry Cloud Job Sync</Product>
+    <AssemblyTitle>Photogrammetry Cloud Job Sync</AssemblyTitle>
+    <Company>PhotogrammetryCloudJobSync</Company>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <SampleAppDir>$(MSBuildProjectDirectory)\libs</SampleAppDir>
+    <!-- SampleApp SDK was built against Extensions 10.x while TFM is net8; remaining unify noise is harmless. -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+  </PropertyGroup>
+
+  <!-- Release builds straight into App\ (easy start; avoids duplicating bin\Release + App) -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <OutputPath>$(MSBuildProjectDirectory)\App\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="SampleShared">
+      <HintPath>$(SampleAppDir)\SampleShared.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Trimble.Gcs.Photogrammetry.Sdk">
+      <HintPath>$(SampleAppDir)\Trimble.Gcs.Photogrammetry.Sdk.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Trimble.ID">
+      <HintPath>$(SampleAppDir)\Trimble.ID.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Trimble.ID.Desktop">
+      <HintPath>$(SampleAppDir)\Trimble.ID.Desktop.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Trimble.Connect.Client">
+      <HintPath>$(SampleAppDir)\Trimble.Connect.Client.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Trimble.Connect.Client.Common">
+      <HintPath>$(SampleAppDir)\Trimble.Connect.Client.Common.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(SampleAppDir)\Newtonsoft.Json.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Net.Http.Formatting">
+      <HintPath>$(SampleAppDir)\System.Net.Http.Formatting.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="TrimbleCloud.Common">
+      <HintPath>$(SampleAppDir)\TrimbleCloud.Common.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="TrimbleCloud.Common.Logging">
+      <HintPath>$(SampleAppDir)\TrimbleCloud.Common.Logging.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.IdentityModel.JsonWebTokens">
+      <HintPath>$(SampleAppDir)\Microsoft.IdentityModel.JsonWebTokens.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.IdentityModel.Tokens">
+      <HintPath>$(SampleAppDir)\Microsoft.IdentityModel.Tokens.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.IdentityModel.Abstractions">
+      <HintPath>$(SampleAppDir)\Microsoft.IdentityModel.Abstractions.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.IdentityModel.Logging">
+      <HintPath>$(SampleAppDir)\Microsoft.IdentityModel.Logging.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Polly">
+      <HintPath>$(SampleAppDir)\Polly.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Polly.Core">
+      <HintPath>$(SampleAppDir)\Polly.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Http.Polly">
+      <HintPath>$(SampleAppDir)\Microsoft.Extensions.Http.Polly.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="app.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>
