@@ -100,6 +100,10 @@
       <HintPath>$(SampleAppDir)\Microsoft.Extensions.Http.Polly.dll</HintPath>
       <Private>true</Private>
     </Reference>
+    <Reference Include="Polly.Extensions.Http">
+      <HintPath>$(SampleAppDir)\Polly.Extensions.Http.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>
