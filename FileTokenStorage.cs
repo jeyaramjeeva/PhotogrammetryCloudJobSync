@@ -1,72 +1,72 @@
+using System.IO.IsolatedStorage;
 using System.Security.Cryptography;
 using System.Text;
 using Trimble.ID;
 
 namespace PhotogrammetryCloudJobSync;
 
-/// <summary>Simple encrypted file-backed token storage under LocalApplicationData.</summary>
+/// <summary>
+/// Trimble.ID persistent storage — same stack as Photogrammetry SampleApp
+/// (<see cref="EncryptedStorage"/> over <see cref="IsolatedFileStorage"/>).
+/// </summary>
 public sealed class FileTokenStorage : IPersistantStorage
 {
-    private readonly string _folder;
-    private readonly byte[] _entropy;
+    private readonly string _storeName;
+    private readonly EncryptedStorage _inner;
 
     public FileTokenStorage(string appName, string environmentSuffix)
     {
-        _folder = Path.Combine(
-            System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
-            AppInfo.AppFolderName,
-            environmentSuffix);
-        Directory.CreateDirectory(_folder);
-        _entropy = SHA256.HashData(Encoding.UTF8.GetBytes(appName + "|" + environmentSuffix + "|v1"));
+        _storeName = $"{AppInfo.AppFolderName}.{environmentSuffix}";
+        var secret = SHA256.HashData(Encoding.UTF8.GetBytes(appName + "|" + environmentSuffix + "|v1"));
+        // SampleApp uses an 8-byte secret with EncryptedStorage.
+        var key = secret.AsSpan(0, 8).ToArray();
+        _inner = new EncryptedStorage(new IsolatedFileStorage(_storeName), key);
     }
 
-    public void SetItem(string key, string value)
-    {
-        var path = GetPath(key);
-        var plain = Encoding.UTF8.GetBytes(value ?? string.Empty);
-        var protectedBytes = ProtectedData.Protect(plain, _entropy, DataProtectionScope.CurrentUser);
-        File.WriteAllBytes(path, protectedBytes);
-    }
+    public void SetItem(string key, string value) => _inner.SetItem(key, value);
 
-    public string GetItem(string key)
-    {
-        var path = GetPath(key);
-        if (!File.Exists(path))
-            return string.Empty;
+    public string GetItem(string key) => _inner.GetItem(key);
 
-        try
-        {
-            var protectedBytes = File.ReadAllBytes(path);
-            var plain = ProtectedData.Unprotect(protectedBytes, _entropy, DataProtectionScope.CurrentUser);
-            return Encoding.UTF8.GetString(plain);
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
-
-    public void RemoveItem(string key)
-    {
-        var path = GetPath(key);
-        if (File.Exists(path))
-            File.Delete(path);
-    }
+    public void RemoveItem(string key) => _inner.RemoveItem(key);
 
     public void Clear()
     {
-        if (!Directory.Exists(_folder))
-            return;
-
-        foreach (var file in Directory.EnumerateFiles(_folder, "*.bin"))
+        try
         {
-            try { File.Delete(file); } catch { /* ignore */ }
+            using var iso = IsolatedStorageFile.GetUserStoreForAssembly();
+            if (iso.DirectoryExists(_storeName))
+                DeleteDirectoryRecursive(iso, _storeName);
+        }
+        catch
+        {
+            // ignore
         }
     }
 
-    private string GetPath(string key)
+    public bool HasEntries()
     {
-        var safe = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..32];
-        return Path.Combine(_folder, safe + ".bin");
+        try
+        {
+            using var iso = IsolatedStorageFile.GetUserStoreForAssembly();
+            if (!iso.DirectoryExists(_storeName))
+                return false;
+            return iso.GetFileNames(Path.Combine(_storeName, "*")).Length > 0
+                   || iso.GetDirectoryNames(Path.Combine(_storeName, "*")).Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void DeleteDirectoryRecursive(IsolatedStorageFile isoStore, string dirPath)
+    {
+        foreach (var file in isoStore.GetFileNames(Path.Combine(dirPath, "*")))
+            isoStore.DeleteFile(Path.Combine(dirPath, file));
+
+        foreach (var sub in isoStore.GetDirectoryNames(Path.Combine(dirPath, "*")))
+            DeleteDirectoryRecursive(isoStore, Path.Combine(dirPath, sub));
+
+        isoStore.DeleteDirectory(dirPath);
     }
 }

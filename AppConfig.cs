@@ -18,6 +18,17 @@ public sealed class AppConfig
 
     public bool IncludeFailedJobs { get; set; } = true;
 
+    /// <summary>
+    /// Output types to download (e.g. pointcloud, mesh, debug). Empty / null = all types.
+    /// </summary>
+    public List<string> IncludedOutputTypes { get; set; } = new();
+
+    /// <summary>Known UI checklist for <see cref="IncludedOutputTypes"/> (case-insensitive).</summary>
+    public static readonly string[] KnownOutputTypes =
+    {
+        "pointcloud", "mesh", "report", "debug", "project", "monitor", "ortho", "other"
+    };
+
     /// <summary>How many jobs to download at the same time. 2 is a good balance; 3 max recommended.</summary>
     public int MaxConcurrentJobs { get; set; } = 2;
 

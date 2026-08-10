@@ -14,6 +14,7 @@ public sealed class UserSettings
     public string? SelectedRegion { get; set; }
     public int? WatchIntervalMinutes { get; set; }
     public bool? IncludeFailedJobs { get; set; }
+    public List<string>? IncludedOutputTypes { get; set; }
     public int? MaxConcurrentJobs { get; set; }
     public int? MaxConcurrentFileDownloads { get; set; }
 
@@ -75,6 +76,13 @@ public sealed class UserSettings
         if (IncludeFailedJobs.HasValue)
             config.IncludeFailedJobs = IncludeFailedJobs.Value;
 
+        if (IncludedOutputTypes != null)
+            config.IncludedOutputTypes = IncludedOutputTypes
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Select(t => t.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
         if (MaxConcurrentJobs is > 0)
             config.MaxConcurrentJobs = MaxConcurrentJobs.Value;
 
@@ -90,6 +98,7 @@ public sealed class UserSettings
         SelectedRegion = config.SelectedRegion,
         WatchIntervalMinutes = config.WatchIntervalMinutes,
         IncludeFailedJobs = config.IncludeFailedJobs,
+        IncludedOutputTypes = (config.IncludedOutputTypes ?? new List<string>()).ToList(),
         MaxConcurrentJobs = config.MaxConcurrentJobs,
         MaxConcurrentFileDownloads = config.MaxConcurrentFileDownloads
     };

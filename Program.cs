@@ -6,7 +6,8 @@ internal static class Program
     private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        Application.SetHighDpiMode(HighDpiMode.SystemAware);
+        // Per-monitor DPI so the UI stays readable on high-DPI / multi-monitor setups.
+        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 

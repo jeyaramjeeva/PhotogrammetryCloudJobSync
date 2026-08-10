@@ -8,6 +8,7 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _miSyncNow;
     private readonly ToolStripMenuItem _miPause;
+    private readonly ToolStripMenuItem _miCancel;
     private readonly ToolStripMenuItem _miSignIn;
 
     public TrayAppContext(SyncService sync)
@@ -17,6 +18,7 @@ public sealed class TrayAppContext : ApplicationContext
 
         _miSyncNow = new ToolStripMenuItem("Sync now", null, (_, _) => _sync.RequestSyncNow());
         _miPause = new ToolStripMenuItem("Pause", null, (_, _) => TogglePause());
+        _miCancel = new ToolStripMenuItem("Cancel", null, (_, _) => _sync.CancelSync());
         _miSignIn = new ToolStripMenuItem("Sign in", null, async (_, _) => await ToggleSignInAsync());
 
         var menu = new ContextMenuStrip();
@@ -24,6 +26,7 @@ public sealed class TrayAppContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_miSyncNow);
         menu.Items.Add(_miPause);
+        menu.Items.Add(_miCancel);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_miSignIn);
         menu.Items.Add(new ToolStripSeparator());
@@ -74,12 +77,13 @@ public sealed class TrayAppContext : ApplicationContext
         _miSignIn.Text = signedIn ? "Sign out" : "Sign in";
         _miSyncNow.Enabled = signedIn && !_sync.IsBusy;
         _miPause.Enabled = signedIn;
-        _miPause.Text = _sync.State == SyncUiState.Paused ? "Resume" : "Pause";
+        _miPause.Text = (_sync.IsPaused || _sync.State == SyncUiState.Paused) ? "Resume" : "Pause";
+        _miCancel.Enabled = signedIn && (_sync.IsBusy || _sync.State == SyncUiState.Waiting);
     }
 
     private void TogglePause()
     {
-        if (_sync.State == SyncUiState.Paused)
+        if (_sync.IsPaused || _sync.State == SyncUiState.Paused)
             _sync.Resume();
         else
             _sync.Pause();

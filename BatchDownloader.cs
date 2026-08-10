@@ -19,6 +19,7 @@ public sealed class BatchDownloader
     private readonly object _logLock = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromHours(2) };
     private readonly ConcurrentDictionary<string, SyncFileProgress> _activeDownloads = new();
+    private readonly ConcurrentDictionary<string, SyncJobItem> _jobQueue = new(StringComparer.OrdinalIgnoreCase);
     private long _lastProgressPublishMs;
     private string _lastStatusDetail = "";
 
@@ -36,15 +37,22 @@ public sealed class BatchDownloader
     public async Task<PassResult> RunPassAsync(CancellationToken ct)
     {
         Directory.CreateDirectory(_config.OutputRoot);
+        _jobQueue.Clear();
 
         var projects = ResolveProjects();
         var jobParallelism = Math.Clamp(_config.MaxConcurrentJobs, 1, 3);
         var fileParallelism = Math.Clamp(_config.MaxConcurrentFileDownloads, 1, 6);
+        var typesLabel = _config.IncludedOutputTypes is { Count: > 0 }
+            ? string.Join(", ", _config.IncludedOutputTypes)
+            : "all";
 
         Log("Settings");
         Log($"  Jobs at once     : {jobParallelism}");
         Log($"  Files at once    : {fileParallelism}");
         Log($"  Verify/repair    : {_config.VerifyAndRepairMissingFiles}");
+        Log($"  Failed jobs      : {(_config.IncludeFailedJobs ? "include" : "skip")}");
+        Log($"  Output types     : {typesLabel}");
+        Log($"  Projects         : {projects.Count}");
         Log($"  Output folder    : {_config.OutputRoot}");
         ReportProgress("Starting sync…", "Scanning cloud…", 0, active: true, clearFiles: true);
 
@@ -64,9 +72,14 @@ public sealed class BatchDownloader
             Log($"Login error during pass: {ex.Message}");
             try
             {
+                // Prefer interactive re-login when refresh token is missing after long downloads.
                 await _auth.EnsureAuthenticatedAsync(ct, "after API auth error").ConfigureAwait(false);
                 Log("Login recovered — retrying this pass once...");
                 summary = await RunOnceAsync(projects, jobParallelism, fileParallelism, ct).ConfigureAwait(false);
+            }
+            catch (AuthExpiredException)
+            {
+                throw;
             }
             catch (Exception recoverEx)
             {
@@ -180,6 +193,7 @@ public sealed class BatchDownloader
             foreach (var dataset in datasets.OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
             {
                 ct.ThrowIfCancellationRequested();
+                await _auth.EnsureAuthenticatedAsync(ct, $"before dataset {dataset.Name}").ConfigureAwait(false);
                 await ProcessDatasetAsync(projectTrn, dataset, jobParallelism, fileParallelism, summary, ct)
                     .ConfigureAwait(false);
             }
@@ -278,6 +292,15 @@ public sealed class BatchDownloader
             return;
         }
 
+        foreach (var job in toProcess)
+        {
+            UpsertQueueItem(
+                job.Id!,
+                $"{datasetName} · {JobLabel(job)}",
+                SyncJobItemState.Pending,
+                folderPath: null);
+        }
+
         Log($"  Processing {toProcess.Count} finished job(s) now...");
         Log("");
 
@@ -333,10 +356,13 @@ public sealed class BatchDownloader
         var folderName = BuildJobFolderName(job);
         var existingFolder = FindExistingJobFolder(datasetFolder, job.Id!);
         var targetFolder = existingFolder ?? Path.Combine(datasetFolder, folderName);
+        var queueLabel = $"{datasetName} · {label}";
 
         Log($"===== Job {jobIndex}/{jobTotal}: {label} =====");
         Log($"  [{tag}] Status : {job.Status}");
         Log($"  [{tag}] Folder : {targetFolder}");
+
+        UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Downloading, targetFolder);
 
         var jobHeadline = $"Job {jobIndex}/{jobTotal} · {datasetName} · {tag}";
 
@@ -349,8 +375,11 @@ public sealed class BatchDownloader
                 Log($"  [{tag}] SKIP — already complete (.download_ok)");
                 Log("");
                 Interlocked.Increment(ref summary.SkippedExisting);
+                UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Skipped, existingFolder);
                 return;
             }
+
+            await _auth.EnsureAuthenticatedAsync(ct, $"before job {tag}").ConfigureAwait(false);
 
             ReportProgress("Asking cloud for file list…", 2, active: true);
             Log($"  [{tag}] Step 1/3: asking cloud for output file list...");
@@ -365,6 +394,7 @@ public sealed class BatchDownloader
                 Log($"  [{tag}] RESULT : cloud listing failed — NOT marking complete (retry next pass)");
                 Log("");
                 Interlocked.Increment(ref summary.Errors);
+                UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, targetFolder);
                 return;
             }
 
@@ -380,18 +410,20 @@ public sealed class BatchDownloader
                         EnsureCompleteMarker(existingFolder, $"failed job, no outputs @ {DateTimeOffset.Now:o}\n");
                         Log($"  [{tag}] RESULT : failed job, no outputs in cloud — SKIP (complete)");
                         Interlocked.Increment(ref summary.SkippedExisting);
+                        UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Skipped, existingFolder);
                     }
                     else
                     {
                         Log($"  [{tag}] RESULT : Completed job but cloud returned 0 files — DEFER (not marking complete)");
                         Interlocked.Increment(ref summary.Errors);
+                        UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, existingFolder);
                     }
 
                     Log("");
                     return;
                 }
 
-                var missing = GetMissingFiles(existingFolder, remoteFiles);
+                var missing = OrderSmallestFirst(GetMissingFiles(existingFolder, remoteFiles));
                 Log($"  [{tag}] Local check: {remoteFiles.Count - missing.Count} already on disk, {missing.Count} missing");
 
                 if (missing.Count == 0)
@@ -401,6 +433,7 @@ public sealed class BatchDownloader
                     Log($"  [{tag}] SKIP — all {remoteFiles.Count} files already here");
                     Log("");
                     Interlocked.Increment(ref summary.SkippedExisting);
+                    UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Skipped, existingFolder);
                     return;
                 }
 
@@ -409,12 +442,13 @@ public sealed class BatchDownloader
                     Log($"  [{tag}] RESULT : folder exists, missing {missing.Count} — SKIP (repair disabled)");
                     Log("");
                     Interlocked.Increment(ref summary.SkippedExisting);
+                    UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Skipped, existingFolder);
                     return;
                 }
 
-                Log($"  [{tag}] Step 2/3: REPAIR — downloading {missing.Count} missing file(s) (up to {fileParallelism} at once)...");
+                Log($"  [{tag}] Step 2/3: REPAIR — downloading {missing.Count} missing file(s) (smallest first, up to {fileParallelism} at once)...");
                 foreach (var m in missing)
-                    Log($"  [{tag}]    need: {m.RelativePath}");
+                    Log($"  [{tag}]    need: {m.RelativePath} ({FormatSize(m.Size ?? 0)})");
 
                 var timings = await DownloadFilesAsync(
                         projectTrn, datasetId, job.Id!, existingFolder, missing, fileParallelism, tag, jobHeadline, ct)
@@ -429,11 +463,13 @@ public sealed class BatchDownloader
                     Log($"  [{tag}] Step 3/3: REPAIR DONE — saved to:");
                     Log($"  [{tag}]    {existingFolder}");
                     Interlocked.Increment(ref summary.Downloaded);
+                    UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Done, existingFolder);
                 }
                 else
                 {
                     Log($"  [{tag}] RESULT : REPAIR incomplete ({stillMissing.Count} still missing)");
                     Interlocked.Increment(ref summary.Failed);
+                    UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, existingFolder);
                 }
 
                 Log("");
@@ -451,31 +487,32 @@ public sealed class BatchDownloader
                     WriteTimingsFile(targetFolder, job, Array.Empty<FileTiming>(), isRepair: false);
                     Log($"  [{tag}] RESULT : failed job, no outputs — marked complete");
                     Interlocked.Increment(ref summary.Downloaded);
+                    UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Done, targetFolder);
                 }
                 else
                 {
                     Log($"  [{tag}] RESULT : Completed job, 0 cloud files — DEFER (not marking complete)");
                     TryDeleteDirectory(targetFolder);
                     Interlocked.Increment(ref summary.Errors);
+                    UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, null);
                 }
 
                 Log("");
                 return;
             }
 
-            Log($"  [{tag}] Step 2/3: DOWNLOAD — {remoteFiles.Count} file(s), up to {fileParallelism} in parallel");
+            var toDownload = OrderSmallestFirst(
+                remoteFiles.Select(f => f with { LocalPath = Path.Combine(targetFolder, f.RelativePath) }));
+
+            Log($"  [{tag}] Step 2/3: DOWNLOAD — {toDownload.Count} file(s) (smallest first), up to {fileParallelism} in parallel");
             Log($"  [{tag}]    to: {targetFolder}");
             Log($"  [{tag}] File list:");
             var i = 0;
-            foreach (var f in remoteFiles)
+            foreach (var f in toDownload)
             {
                 i++;
                 Log($"  [{tag}]    {i,3}. {f.RelativePath}  ({FormatSize(f.Size ?? 0)})");
             }
-
-            var toDownload = remoteFiles
-                .Select(f => f with { LocalPath = Path.Combine(targetFolder, f.RelativePath) })
-                .ToList();
 
             var timingsFresh = await DownloadFilesAsync(
                     projectTrn, datasetId, job.Id!, targetFolder, toDownload, fileParallelism, tag, jobHeadline, ct)
@@ -490,21 +527,25 @@ public sealed class BatchDownloader
                 Log($"  [{tag}] Step 3/3: DOWNLOAD DONE — {timingsFresh.Count(t => t.Success)} file(s) saved");
                 Log($"  [{tag}]    {targetFolder}");
                 Interlocked.Increment(ref summary.Downloaded);
+                UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Done, targetFolder);
             }
             else
             {
                 Log($"  [{tag}] RESULT : DOWNLOAD incomplete — {stillMissingFresh.Count} file(s) still missing");
                 Interlocked.Increment(ref summary.Failed);
+                UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, targetFolder);
             }
 
             Log("");
         }
         catch (OperationCanceledException)
         {
+            UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, targetFolder);
             throw;
         }
         catch (Exception ex) when (AuthSession.IsAuthFailure(ex))
         {
+            UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, targetFolder);
             throw;
         }
         catch (Exception ex)
@@ -512,6 +553,7 @@ public sealed class BatchDownloader
             Log($"  [{tag}] ERROR: {ex.Message}");
             Log("");
             Interlocked.Increment(ref summary.Errors);
+            UpsertQueueItem(job.Id!, queueLabel, SyncJobItemState.Failed, targetFolder);
         }
     }
 
@@ -707,6 +749,10 @@ public sealed class BatchDownloader
             await local.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
             written += read;
 
+            // Do NOT refresh Trimble auth during CDN downloads. The file URL does not use
+            // the access token; calling RetrieveToken here opens browser popups and can abort
+            // multi-GB transfers when the refresh token is missing.
+
             if (lastUi.Elapsed < TimeSpan.FromMilliseconds(300))
                 continue;
 
@@ -847,6 +893,13 @@ public sealed class BatchDownloader
 
         if (outputTypes.Length == 0)
             return new RemoteListResult(Array.Empty<RemoteFile>(), Succeeded: true);
+
+        outputTypes = FilterOutputTypes(outputTypes, tag);
+        if (outputTypes.Length == 0)
+        {
+            Log($"  [{tag}]   → no output types left after filter");
+            return new RemoteListResult(Array.Empty<RemoteFile>(), Succeeded: true);
+        }
 
         var files = new ConcurrentBag<RemoteFile>();
         var typeErrors = 0;
@@ -1107,7 +1160,8 @@ public sealed class BatchDownloader
                 detail,
                 Math.Clamp(percent, 0, 100),
                 active,
-                files));
+                files,
+                SnapshotQueue()));
         }
         catch
         {
@@ -1130,7 +1184,8 @@ public sealed class BatchDownloader
                 status,
                 Math.Clamp(percent, 0, 100),
                 active,
-                files));
+                files,
+                SnapshotQueue()));
         }
         catch
         {
@@ -1141,7 +1196,7 @@ public sealed class BatchDownloader
     private void PublishDownloadProgress(bool force)
     {
         var now = Environment.TickCount64;
-        if (!force && now - _lastProgressPublishMs < 200)
+        if (!force && now - _lastProgressPublishMs < 300)
             return;
         _lastProgressPublishMs = now;
 
@@ -1159,13 +1214,99 @@ public sealed class BatchDownloader
                 ? (_lastStatusDetail.Length > 0 ? _lastStatusDetail : "Waiting…")
                 : $"{files.Count} file(s) in progress";
 
-            ProgressSink?.Invoke(new SyncProgress(headline, detail, Math.Clamp(avg, 0, 100), true, files));
+            ProgressSink?.Invoke(new SyncProgress(
+                headline, detail, Math.Clamp(avg, 0, 100), true, files, SnapshotQueue()));
         }
         catch
         {
             // ignore
         }
     }
+
+    private void UpsertQueueItem(string id, string label, SyncJobItemState state, string? folderPath)
+    {
+        _jobQueue.TryGetValue(id, out var existing);
+        var next = new SyncJobItem(
+            id,
+            label,
+            state,
+            folderPath ?? existing?.FolderPath);
+
+        if (existing is not null
+            && existing.State == next.State
+            && string.Equals(existing.Label, next.Label, StringComparison.Ordinal)
+            && string.Equals(existing.FolderPath, next.FolderPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _jobQueue[id] = next;
+
+        // While files are downloading, PublishDownloadProgress already pushes queue state (~200ms).
+        // Extra publishes here fight the headline/detail and cause flicker.
+        if (!_activeDownloads.IsEmpty)
+            return;
+
+        try
+        {
+            var files = SnapshotFiles();
+            ProgressSink?.Invoke(new SyncProgress(
+                BuildStableHeadline(files, _lastStatusDetail.Length > 0 ? _lastStatusDetail : "Syncing"),
+                _lastStatusDetail.Length > 0 ? _lastStatusDetail : "Updating queue…",
+                files.Count == 0 ? 0 : (int)files.Average(f => f.Percent),
+                true,
+                files,
+                SnapshotQueue()));
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    private IReadOnlyList<SyncJobItem> SnapshotQueue() =>
+        _jobQueue.Values
+            .OrderBy(j => j.State)
+            .ThenBy(j => j.Label, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private string[] FilterOutputTypes(string[] outputTypes, string tag)
+    {
+        var included = _config.IncludedOutputTypes;
+        if (included is not { Count: > 0 })
+            return outputTypes;
+
+        var allow = new HashSet<string>(included, StringComparer.OrdinalIgnoreCase);
+        var allowOther = allow.Contains("other");
+        var knownNamed = new HashSet<string>(
+            AppConfig.KnownOutputTypes.Where(t => !t.Equals("other", StringComparison.OrdinalIgnoreCase)),
+            StringComparer.OrdinalIgnoreCase);
+
+        var filtered = outputTypes
+            .Where(ot =>
+            {
+                if (allow.Contains(ot))
+                    return true;
+                if (knownNamed.Contains(ot))
+                    return false;
+                return allowOther;
+            })
+            .ToArray();
+
+        var skipped = outputTypes
+            .Except(filtered, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (skipped.Count > 0)
+            Log($"  [{tag}]   → skipping output types: {string.Join(", ", skipped)}");
+
+        return filtered;
+    }
+
+    private static List<RemoteFile> OrderSmallestFirst(IEnumerable<RemoteFile> files) =>
+        files
+            .OrderBy(f => f.Size ?? long.MaxValue)
+            .ThenBy(f => f.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
     private static string BuildStableHeadline(IReadOnlyList<SyncFileProgress> files, string fallback)
     {

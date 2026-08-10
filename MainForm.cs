@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Reflection;
+
 namespace PhotogrammetryCloudJobSync;
 
 public sealed class MainForm : Form
@@ -8,14 +11,20 @@ public sealed class MainForm : Form
     private readonly Label _lblLast;
     private readonly ComboBox _cboEnvironment;
     private readonly ComboBox _cboServer;
-    private readonly ComboBox _cboProject;
+    private readonly CheckedListBox _lstProjects;
     private readonly ComboBox _cboInterval;
     private readonly TextBox _txtOutput;
+    private readonly CheckBox _chkSkipFailed;
+    private readonly FlowLayoutPanel _pnlOutputTypes;
+    private readonly Dictionary<string, CheckBox> _outputTypeChecks = new(StringComparer.OrdinalIgnoreCase);
     private readonly Button _btnRefreshCatalog;
     private readonly Button _btnSignIn;
     private readonly Button _btnSyncNow;
     private readonly Button _btnPause;
+    private readonly Button _btnCancel;
     private readonly Button _btnSave;
+    private readonly Button _btnOpenFolder;
+    private readonly ListView _lstQueue;
     private readonly TextBox _txtLog;
     private readonly Label _lblProgressHeadline;
     private readonly Label _lblProgressDetail;
@@ -25,10 +34,14 @@ public sealed class MainForm : Form
     private readonly Dictionary<string, int> _fileSlotById = new(StringComparer.Ordinal);
     private SyncProgress? _pendingProgress;
     private bool _progressUiQueued;
+    private string _lastQueueSignature = "";
+    private string _lastHeadline = "";
+    private string _lastDetail = "";
+    private string _lastPctText = "";
     private bool _suppressCloseExit;
     private bool _suppressEnvHandler;
     private bool _loadingCatalog;
-    private string? _pendingProjectTrn;
+    private List<string> _pendingProjectTrns = new();
     private CancellationTokenSource? _catalogCts;
 
     public MainForm(SyncService sync)
@@ -36,32 +49,44 @@ public sealed class MainForm : Form
         _sync = sync;
         Text = AppInfo.DisplayName;
         Icon = AppIcon.Get();
-        Width = 720;
-        Height = 780;
-        MinimumSize = new Size(600, 680);
+        Width = 980;
+        Height = 940;
+        MinimumSize = new Size(860, 780);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.Sizable;
-        MaximizeBox = false;
+        MaximizeBox = true;
         Font = new Font("Segoe UI", 9f);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        DoubleBuffered = true;
+
+        // Prefer a readable default size on the current monitor (not a tiny fixed window).
+        try
+        {
+            var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Width = Math.Clamp((int)(wa.Width * 0.62), 900, Math.Max(900, wa.Width - 48));
+            Height = Math.Clamp((int)(wa.Height * 0.88), 820, Math.Max(820, wa.Height - 48));
+        }
+        catch { /* keep defaults */ }
 
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(12),
             ColumnCount = 1,
-            RowCount = 12
+            RowCount = 11
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 250));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 24)); // user
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 24)); // status
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34)); // environment + server + refresh
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 120)); // projects
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56)); // options + types (tight)
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32)); // interval
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32)); // output
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 36)); // buttons
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 22)); // last
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 260)); // progress + queue
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); // log
         Controls.Add(root);
 
         _lblUser = new Label { Dock = DockStyle.Fill, Text = "Account: —", AutoEllipsis = true };
@@ -69,26 +94,91 @@ public sealed class MainForm : Form
         root.Controls.Add(_lblUser, 0, 0);
         root.Controls.Add(_lblStatus, 0, 1);
 
-        root.Controls.Add(LabeledCombo("Environment:", out _cboEnvironment, 180), 0, 2);
+        // Environment + Server + Refresh on one line
+        var envServerRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 5, RowCount = 1 };
+        envServerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+        envServerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
+        envServerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58));
+        envServerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
+        envServerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 80));
+        envServerRow.Controls.Add(new Label { Text = "Environment:", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        _cboEnvironment = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
         foreach (var (label, value) in SyncService.EnvironmentPresets)
             _cboEnvironment.Items.Add(new EnvItem(label, value));
         _cboEnvironment.SelectedIndexChanged += (_, _) => _ = SafeUiAsync(OnEnvironmentChangedAsync);
-
-        var serverRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1 };
-        serverRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
-        serverRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        serverRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
-        serverRow.Controls.Add(new Label { Text = "Server:", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        envServerRow.Controls.Add(_cboEnvironment, 1, 0);
+        envServerRow.Controls.Add(new Label { Text = "Server:", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 2, 0);
         _cboServer = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
         _cboServer.SelectedIndexChanged += (_, _) => _ = SafeUiAsync(OnServerChangedAsync);
-        serverRow.Controls.Add(_cboServer, 1, 0);
+        envServerRow.Controls.Add(_cboServer, 3, 0);
         _btnRefreshCatalog = new Button { Text = "Refresh", Dock = DockStyle.Fill };
         _btnRefreshCatalog.Click += (_, _) => _ = SafeUiAsync(() => LoadServersAsync(force: true));
-        serverRow.Controls.Add(_btnRefreshCatalog, 2, 0);
-        root.Controls.Add(serverRow, 0, 3);
+        envServerRow.Controls.Add(_btnRefreshCatalog, 4, 0);
+        root.Controls.Add(envServerRow, 0, 2);
 
-        root.Controls.Add(LabeledCombo("Project:", out _cboProject, 0), 0, 4);
-        _cboProject.DropDownStyle = ComboBoxStyle.DropDownList;
+        // Projects multi-select
+        var projectPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
+        projectPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+        projectPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        projectPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        projectPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        projectPanel.Controls.Add(new Label { Text = "Projects:", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        var projectLinks = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
+        var btnAll = new LinkLabel { Text = "Select all", AutoSize = true, Margin = new Padding(0, 2, 12, 0) };
+        var btnNone = new LinkLabel { Text = "Select none", AutoSize = true, Margin = new Padding(0, 2, 0, 0) };
+        btnAll.Click += (_, _) => SetAllProjectsChecked(true);
+        btnNone.Click += (_, _) => SetAllProjectsChecked(false);
+        projectLinks.Controls.Add(btnAll);
+        projectLinks.Controls.Add(btnNone);
+        projectPanel.Controls.Add(projectLinks, 1, 0);
+        _lstProjects = new CheckedListBox
+        {
+            Dock = DockStyle.Fill,
+            CheckOnClick = true,
+            IntegralHeight = false
+        };
+        projectPanel.Controls.Add(_lstProjects, 1, 1);
+        root.Controls.Add(projectPanel, 0, 3);
+
+        // Options + types — fixed row heights (no Percent stretch → no empty gap)
+        var opts = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
+        opts.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+        opts.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        opts.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        opts.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        opts.Controls.Add(new Label { Text = "Options:", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        _chkSkipFailed = new CheckBox
+        {
+            Text = "Skip failed jobs",
+            AutoSize = true,
+            Dock = DockStyle.Left,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+        opts.Controls.Add(_chkSkipFailed, 1, 0);
+        opts.Controls.Add(new Label { Text = "Types:", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 1);
+        _pnlOutputTypes = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            WrapContents = true,
+            AutoScroll = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0),
+            Margin = new Padding(0)
+        };
+        foreach (var t in AppConfig.KnownOutputTypes)
+        {
+            var cb = new CheckBox
+            {
+                Text = t,
+                AutoSize = true,
+                Checked = true,
+                Margin = new Padding(0, 1, 12, 1)
+            };
+            _outputTypeChecks[t] = cb;
+            _pnlOutputTypes.Controls.Add(cb);
+        }
+        opts.Controls.Add(_pnlOutputTypes, 1, 1);
+        root.Controls.Add(opts, 0, 4);
 
         var intervalPanel = LabeledCombo("Sync every:", out _cboInterval, 160);
         foreach (var (label, minutes) in SyncService.IntervalPresets)
@@ -111,31 +201,43 @@ public sealed class MainForm : Form
         _btnSignIn = new Button { Text = "Sign in", Width = 90, Height = 28 };
         _btnSyncNow = new Button { Text = "Sync now", Width = 90, Height = 28 };
         _btnPause = new Button { Text = "Pause", Width = 90, Height = 28 };
+        _btnCancel = new Button { Text = "Cancel", Width = 90, Height = 28 };
         _btnSave = new Button { Text = "Save settings", Width = 110, Height = 28 };
         _btnSignIn.Click += (_, _) => _ = SafeUiAsync(OnSignInClickAsync);
         _btnSyncNow.Click += (_, _) =>
         {
             SaveSettingsFromUi();
+            ActiveControl = _txtLog;
             _sync.RequestSyncNow();
         };
         _btnPause.Click += (_, _) => OnPauseClick();
+        _btnCancel.Click += (_, _) =>
+        {
+            _sync.CancelSync();
+            RefreshFromService();
+        };
         _btnSave.Click += (_, _) =>
         {
             SaveSettingsFromUi();
             MessageBox.Show(this, "Settings saved.", AppInfo.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Information);
         };
-        buttons.Controls.AddRange(new Control[] { _btnSignIn, _btnSyncNow, _btnPause, _btnSave });
+        buttons.Controls.AddRange(new Control[] { _btnSignIn, _btnSyncNow, _btnPause, _btnCancel, _btnSave });
         root.Controls.Add(buttons, 0, 7);
 
         _lblLast = new Label { Dock = DockStyle.Fill, Text = "", AutoEllipsis = true, ForeColor = Color.DimGray };
         root.Controls.Add(_lblLast, 0, 8);
+
+        // Progress (left) + What's left (right)
+        var mid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
+        mid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
+        mid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
 
         var progressPanel = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
             RowCount = 4,
-            Padding = new Padding(0, 2, 0, 2)
+            Padding = new Padding(0, 2, 6, 2)
         };
         progressPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 20));
         progressPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
@@ -151,13 +253,7 @@ public sealed class MainForm : Form
         };
         progressPanel.Controls.Add(_lblProgressHeadline, 0, 0);
 
-        var barRow = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 1,
-            Margin = new Padding(0)
-        };
+        var barRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
         barRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         barRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 52));
         _progressBar = new ProgressBar
@@ -176,9 +272,7 @@ public sealed class MainForm : Form
             Text = "0%",
             TextAlign = ContentAlignment.MiddleCenter,
             Margin = new Padding(0),
-            Padding = new Padding(0),
-            AutoSize = false,
-            AutoEllipsis = false
+            AutoSize = false
         };
         barRow.Controls.Add(_progressBar, 0, 0);
         barRow.Controls.Add(_lblProgressPct, 1, 0);
@@ -193,23 +287,51 @@ public sealed class MainForm : Form
         };
         progressPanel.Controls.Add(_lblProgressDetail, 0, 2);
 
-        var fileHost = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 6,
-            Padding = new Padding(0, 4, 0, 0)
-        };
-        _fileSlots = new FileProgressSlot[6];
+        var fileHost = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(0, 4, 0, 0) };
+        _fileSlots = new FileProgressSlot[5];
         for (var i = 0; i < _fileSlots.Length; i++)
         {
-            fileHost.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            fileHost.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
             _fileSlots[i] = new FileProgressSlot();
             _fileSlots[i].Visible = false;
             fileHost.Controls.Add(_fileSlots[i], 0, i);
         }
         progressPanel.Controls.Add(fileHost, 0, 3);
-        root.Controls.Add(progressPanel, 0, 9);
+        mid.Controls.Add(progressPanel, 0, 0);
+
+        var queuePanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(6, 2, 0, 2) };
+        queuePanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        queuePanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        queuePanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        queuePanel.Controls.Add(new Label
+        {
+            Text = "What’s left",
+            Dock = DockStyle.Fill,
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft
+        }, 0, 0);
+
+        _lstQueue = new ListView
+        {
+            Dock = DockStyle.Fill,
+            View = View.Details,
+            FullRowSelect = true,
+            MultiSelect = false,
+            HideSelection = false,
+            HeaderStyle = ColumnHeaderStyle.Nonclickable
+        };
+        EnableDoubleBuffer(_lstQueue);
+        _lstQueue.Columns.Add("Status", 90);
+        _lstQueue.Columns.Add("Job", 220);
+        _lstQueue.DoubleClick += (_, _) => OpenSelectedJobFolder();
+        _lstQueue.SelectedIndexChanged += (_, _) => UpdateOpenFolderButton();
+        queuePanel.Controls.Add(_lstQueue, 0, 1);
+
+        _btnOpenFolder = new Button { Text = "Open folder", Dock = DockStyle.Fill, Enabled = false };
+        _btnOpenFolder.Click += (_, _) => OpenSelectedJobFolder();
+        queuePanel.Controls.Add(_btnOpenFolder, 0, 2);
+        mid.Controls.Add(queuePanel, 1, 0);
+        root.Controls.Add(mid, 0, 9);
 
         _txtLog = new TextBox
         {
@@ -335,7 +457,14 @@ public sealed class MainForm : Form
     {
         var cfg = _sync.Config;
         _txtOutput.Text = cfg.OutputRoot ?? "";
-        _pendingProjectTrn = cfg.ProjectTrns?.FirstOrDefault();
+        _pendingProjectTrns = (cfg.ProjectTrns ?? new List<string>()).ToList();
+        _chkSkipFailed.Checked = !cfg.IncludeFailedJobs;
+
+        var included = new HashSet<string>(
+            cfg.IncludedOutputTypes ?? new List<string>(),
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, cb) in _outputTypeChecks)
+            cb.Checked = included.Count == 0 || included.Contains(name);
 
         _suppressEnvHandler = true;
         try
@@ -373,11 +502,14 @@ public sealed class MainForm : Form
             _cboServer.SelectedIndex = 0;
         }
 
-        if (!string.IsNullOrWhiteSpace(_pendingProjectTrn))
+        if (_pendingProjectTrns.Count > 0)
         {
-            _cboProject.Items.Clear();
-            _cboProject.Items.Add(_pendingProjectTrn);
-            _cboProject.SelectedIndex = 0;
+            _lstProjects.Items.Clear();
+            foreach (var trn in _pendingProjectTrns)
+            {
+                var i = _lstProjects.Items.Add(trn);
+                _lstProjects.SetItemChecked(i, true);
+            }
         }
     }
 
@@ -386,15 +518,44 @@ public sealed class MainForm : Form
         var minutes = _cboInterval.SelectedItem is IntervalItem item ? item.Minutes : 60;
         var env = _cboEnvironment.SelectedItem is EnvItem e ? e.Value : "Production";
         var region = _cboServer.SelectedItem?.ToString() ?? "";
-        var project = GetSelectedProjectTrn();
-        _sync.ApplySettings(env, _txtOutput.Text, project, region, minutes);
+        var projects = GetSelectedProjectTrns();
+        var includeFailed = !_chkSkipFailed.Checked;
+        var types = GetSelectedOutputTypes();
+        // If every known type is checked, persist empty (= all) so future types are included.
+        if (types.Count == AppConfig.KnownOutputTypes.Length)
+            types = new List<string>();
+
+        _sync.ApplySettings(env, _txtOutput.Text, projects, region, minutes, includeFailed, types);
     }
 
-    private string GetSelectedProjectTrn()
+    private List<string> GetSelectedProjectTrns()
     {
-        if (_cboProject.SelectedItem is ConnectProjectItem p)
-            return p.ProjectTrn;
-        return _cboProject.SelectedItem?.ToString()?.Trim() ?? "";
+        var list = new List<string>();
+        foreach (var item in _lstProjects.CheckedItems)
+        {
+            if (item is ConnectProjectItem p)
+                list.Add(p.ProjectTrn);
+            else if (item != null)
+                list.Add(item.ToString()!.Trim());
+        }
+        return list;
+    }
+
+    private List<string> GetSelectedOutputTypes()
+    {
+        return _outputTypeChecks
+            .Where(kv => kv.Value.Checked)
+            .Select(kv => kv.Key)
+            .ToList();
+    }
+
+    private string? GetFirstSelectedProjectTrn() =>
+        GetSelectedProjectTrns().FirstOrDefault();
+
+    private void SetAllProjectsChecked(bool check)
+    {
+        for (var i = 0; i < _lstProjects.Items.Count; i++)
+            _lstProjects.SetItemChecked(i, check);
     }
 
     private void BrowseOutput()
@@ -445,7 +606,7 @@ public sealed class MainForm : Form
         CancelCatalogLoad();
         await _sync.ChangeEnvironmentAsync(env.Value);
         _cboServer.Items.Clear();
-        _cboProject.Items.Clear();
+        _lstProjects.Items.Clear();
         RefreshFromService();
     }
 
@@ -487,7 +648,7 @@ public sealed class MainForm : Form
 
             var preferred = _sync.Config.SelectedRegion;
             if (string.IsNullOrWhiteSpace(preferred))
-                preferred = ParseRegion(GetSelectedProjectTrn()) ?? "";
+                preferred = ParseRegion(GetFirstSelectedProjectTrn()) ?? "";
 
             _cboServer.Items.Clear();
             foreach (var r in regions)
@@ -521,7 +682,7 @@ public sealed class MainForm : Form
             AppendLog("Failed to load servers: " + ex.Message);
             try { await _sync.SignOutAsync(); } catch { /* ignore */ }
             _cboServer.Items.Clear();
-            _cboProject.Items.Clear();
+            _lstProjects.Items.Clear();
             MessageBox.Show(this,
                 "Login expired. Please sign in again.",
                 "Load servers failed",
@@ -560,31 +721,31 @@ public sealed class MainForm : Form
             AppendLog($"Loading projects for server '{region}'...");
             var projects = await ConnectCatalog.ListProjectsAsync(session, region, ct);
             ct.ThrowIfCancellationRequested();
-            var preferred = _pendingProjectTrn ?? GetSelectedProjectTrn();
 
-            _cboProject.Items.Clear();
+            var preferred = new HashSet<string>(
+                _pendingProjectTrns.Count > 0 ? _pendingProjectTrns : GetSelectedProjectTrns(),
+                StringComparer.OrdinalIgnoreCase);
+
+            _lstProjects.Items.Clear();
             foreach (var p in projects)
-                _cboProject.Items.Add(p);
+            {
+                var i = _lstProjects.Items.Add(p);
+                if (preferred.Contains(p.ProjectTrn))
+                    _lstProjects.SetItemChecked(i, true);
+            }
 
-            if (_cboProject.Items.Count == 0)
+            if (_lstProjects.Items.Count == 0)
             {
                 AppendLog("No projects on this server.");
                 return;
             }
 
-            var idx = 0;
-            for (var i = 0; i < _cboProject.Items.Count; i++)
-            {
-                if (_cboProject.Items[i] is ConnectProjectItem item &&
-                    string.Equals(item.ProjectTrn, preferred, StringComparison.OrdinalIgnoreCase))
-                {
-                    idx = i;
-                    break;
-                }
-            }
-            _cboProject.SelectedIndex = idx;
-            _pendingProjectTrn = null;
-            AppendLog($"Projects loaded: {projects.Count}");
+            // If nothing matched saved TRNs, check the first project so Sync now has a target.
+            if (_lstProjects.CheckedItems.Count == 0 && _lstProjects.Items.Count > 0)
+                _lstProjects.SetItemChecked(0, true);
+
+            _pendingProjectTrns.Clear();
+            AppendLog($"Projects loaded: {projects.Count} (checked {_lstProjects.CheckedItems.Count})");
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -619,11 +780,10 @@ public sealed class MainForm : Form
                 CancelCatalogLoad();
                 await _sync.SignOutAsync();
                 _cboServer.Items.Clear();
-                _cboProject.Items.Clear();
+                _lstProjects.Items.Clear();
             }
             else
             {
-                // Ensure session matches selected environment before sign-in
                 if (_cboEnvironment.SelectedItem is EnvItem env)
                     await _sync.ChangeEnvironmentAsync(env.Value);
 
@@ -641,7 +801,7 @@ public sealed class MainForm : Form
 
     private void OnPauseClick()
     {
-        if (_sync.State == SyncUiState.Paused)
+        if (_sync.IsPaused || _sync.State == SyncUiState.Paused)
             _sync.Resume();
         else
             _sync.Pause();
@@ -652,36 +812,55 @@ public sealed class MainForm : Form
     {
         var session = _sync.Session;
         var signedIn = session?.IsLoggedIn == true;
-        _lblUser.Text = signedIn
+        SetTextIfChanged(_lblUser, signedIn
             ? $"Account: {session!.UserDisplay}"
-            : "Account: Not signed in";
-        _lblStatus.Text = $"Status: {_sync.StatusText}";
-        _lblLast.Text = _sync.LastPassSummary ?? "";
+            : "Account: Not signed in");
+        SetTextIfChanged(_lblStatus, $"Status: {_sync.StatusText}");
+        SetTextIfChanged(_lblLast, _sync.LastPassSummary ?? "");
 
-        _btnSignIn.Text = signedIn ? "Sign out" : "Sign in";
+        var signInText = signedIn ? "Sign out" : "Sign in";
+        if (_btnSignIn.Text != signInText)
+            _btnSignIn.Text = signInText;
         _btnSignIn.Enabled = true;
-        _btnSyncNow.Enabled = signedIn && !_sync.IsBusy;
+        var syncEnabled = signedIn && !_sync.IsBusy;
+        if (!syncEnabled && ReferenceEquals(ActiveControl, _btnSyncNow))
+            ActiveControl = _txtLog;
+        _btnSyncNow.Enabled = syncEnabled;
         _btnPause.Enabled = signedIn;
-        _btnPause.Text = _sync.State == SyncUiState.Paused ? "Resume" : "Pause";
+        var pauseText = (_sync.IsPaused || _sync.State == SyncUiState.Paused) ? "Resume" : "Pause";
+        if (_btnPause.Text != pauseText)
+            _btnPause.Text = pauseText;
+        _btnCancel.Enabled = signedIn && (_sync.IsBusy || _sync.State == SyncUiState.Waiting);
         _btnRefreshCatalog.Enabled = signedIn && !_loadingCatalog;
         _cboServer.Enabled = signedIn;
-        _cboProject.Enabled = signedIn;
+        _lstProjects.Enabled = signedIn;
+        _chkSkipFailed.Enabled = true;
+        foreach (var cb in _outputTypeChecks.Values)
+            cb.Enabled = true;
+
+        if (ActiveControl is Button { Enabled: false })
+            ActiveControl = _txtLog;
+
+        UpdateOpenFolderButton();
     }
 
     private void ApplyProgress(SyncProgress p)
     {
-        _lblProgressHeadline.Text = p.Headline;
-        _lblProgressDetail.Text = p.Detail;
-        _progressBar.Value = Math.Clamp(p.Percent, 0, 100);
-        _lblProgressPct.Text = $"{p.Percent}%";
-        _lblProgressDetail.ForeColor = !p.IsActive && p.Percent == 0
+        SetTextIfChanged(_lblProgressHeadline, p.Headline, ref _lastHeadline);
+        SetTextIfChanged(_lblProgressDetail, p.Detail, ref _lastDetail);
+        var pct = Math.Clamp(p.Percent, 0, 100);
+        if (_progressBar.Value != pct)
+            _progressBar.Value = pct;
+        SetTextIfChanged(_lblProgressPct, $"{pct}%", ref _lastPctText);
+        var detailColor = !p.IsActive && p.Percent == 0
             ? Color.DimGray
             : Color.FromArgb(40, 40, 40);
+        if (_lblProgressDetail.ForeColor != detailColor)
+            _lblProgressDetail.ForeColor = detailColor;
 
         var files = p.ActiveFiles ?? Array.Empty<SyncFileProgress>();
         var stillActive = new HashSet<string>(files.Select(f => f.Id), StringComparer.Ordinal);
 
-        // Free slots for downloads that finished
         foreach (var kv in _fileSlotById.ToList())
         {
             if (!stillActive.Contains(kv.Key))
@@ -707,7 +886,7 @@ public sealed class MainForm : Form
                 }
 
                 if (slotIndex < 0)
-                    continue; // more than 6 concurrent files — skip extra
+                    continue;
 
                 _fileSlotById[file.Id] = slotIndex;
             }
@@ -725,6 +904,128 @@ public sealed class MainForm : Form
                 slot.Clear();
             }
         }
+
+        ApplyQueue(p.QueueItems);
+    }
+
+    private void ApplyQueue(IReadOnlyList<SyncJobItem>? items)
+    {
+        items ??= Array.Empty<SyncJobItem>();
+        // Avoid Clear()+rebuild every progress tick — that is the main text flicker source.
+        var signature = string.Join('\u001f', items.Select(j =>
+            $"{j.Id}\u001e{j.State}\u001e{j.Label}\u001e{j.FolderPath}"));
+        if (signature == _lastQueueSignature)
+            return;
+        _lastQueueSignature = signature;
+
+        var selectedId = _lstQueue.SelectedItems.Count > 0 && _lstQueue.SelectedItems[0].Tag is SyncJobItem sel
+            ? sel.Id
+            : null;
+
+        _lstQueue.BeginUpdate();
+        try
+        {
+            // In-place update when the same jobs are present in the same order.
+            if (_lstQueue.Items.Count == items.Count
+                && items.Select((j, i) => _lstQueue.Items[i].Tag is SyncJobItem existing
+                                         && string.Equals(existing.Id, j.Id, StringComparison.OrdinalIgnoreCase))
+                    .All(x => x))
+            {
+                for (var i = 0; i < items.Count; i++)
+                {
+                    var job = items[i];
+                    var row = _lstQueue.Items[i];
+                    if (row.Text != job.State.ToString())
+                        row.Text = job.State.ToString();
+                    if (row.SubItems.Count > 1 && row.SubItems[1].Text != job.Label)
+                        row.SubItems[1].Text = job.Label;
+                    row.Tag = job;
+                }
+            }
+            else
+            {
+                _lstQueue.Items.Clear();
+                foreach (var job in items)
+                {
+                    var row = new ListViewItem(job.State.ToString()) { Tag = job };
+                    row.SubItems.Add(job.Label);
+                    _lstQueue.Items.Add(row);
+                    if (selectedId != null && string.Equals(job.Id, selectedId, StringComparison.OrdinalIgnoreCase))
+                        row.Selected = true;
+                }
+            }
+        }
+        finally
+        {
+            _lstQueue.EndUpdate();
+        }
+
+        UpdateOpenFolderButton();
+    }
+
+    private static void SetTextIfChanged(Label label, string text)
+    {
+        if (label.Text != text)
+            label.Text = text;
+    }
+
+    private static void SetTextIfChanged(Label label, string text, ref string cache)
+    {
+        if (cache == text)
+            return;
+        cache = text;
+        if (label.Text != text)
+            label.Text = text;
+    }
+
+    private static void EnableDoubleBuffer(Control control)
+    {
+        typeof(Control)
+            .GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?.SetValue(control, true, null);
+    }
+
+    private void UpdateOpenFolderButton()
+    {
+        var path = GetSelectedJobFolder();
+        _btnOpenFolder.Enabled = !string.IsNullOrWhiteSpace(path) && Directory.Exists(path);
+    }
+
+    private string? GetSelectedJobFolder()
+    {
+        if (_lstQueue.SelectedItems.Count == 0)
+            return null;
+        return _lstQueue.SelectedItems[0].Tag is SyncJobItem job
+            ? job.FolderPath
+            : null;
+    }
+
+    private void OpenSelectedJobFolder()
+    {
+        var path = GetSelectedJobFolder();
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+        {
+            MessageBox.Show(this,
+                "No local folder is available for this job yet.",
+                AppInfo.DisplayName,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = $"\"{path}\"",
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, AppInfo.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private void AppendLog(string line)
@@ -735,12 +1036,14 @@ public sealed class MainForm : Form
         _txtLog.AppendText(line + Environment.NewLine);
     }
 
-    /// <summary>Two-line slot: job+filename on top, bar + % below (no overlap).</summary>
     private sealed class FileProgressSlot : TableLayoutPanel
     {
         private readonly Label _title;
         private readonly ProgressBar _bar;
         private readonly Label _pct;
+        private string _lastTitle = "";
+        private string _lastPct = "";
+        private int _lastBar = -1;
 
         public FileProgressSlot()
         {
@@ -752,6 +1055,8 @@ public sealed class MainForm : Form
             ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
             RowStyles.Add(new RowStyle(SizeType.Absolute, 16));
             RowStyles.Add(new RowStyle(SizeType.Absolute, 18));
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+            DoubleBuffered = true;
 
             _title = new Label
             {
@@ -791,34 +1096,55 @@ public sealed class MainForm : Form
             if (shortName.Length > 64)
                 shortName = "…" + shortName[^60..];
 
-            _title.Text = string.IsNullOrWhiteSpace(file.Detail)
+            var pct = Math.Clamp(file.Percent, 0, 100);
+            if (pct != _lastBar)
+            {
+                _lastBar = pct;
+                _bar.Value = pct;
+            }
+
+            var pctText = $"{pct}%";
+            if (pctText != _lastPct)
+            {
+                _lastPct = pctText;
+                _pct.Text = pctText;
+            }
+
+            // Throttle title (speed/ETA) updates — rewriting every tick causes visible flicker.
+            var now = Environment.TickCount64;
+            var title = string.IsNullOrWhiteSpace(file.Detail)
                 ? $"[{file.JobTag}] {shortName}"
                 : $"[{file.JobTag}] {shortName}  ·  {file.Detail}";
-            _bar.Value = Math.Clamp(file.Percent, 0, 100);
-            _pct.Text = $"{file.Percent}%";
+            if (title != _lastTitle && (now - _lastTitleMs >= 400 || pct != _lastTitlePct))
+            {
+                _lastTitle = title;
+                _lastTitleMs = now;
+                _lastTitlePct = pct;
+                _title.Text = title;
+            }
         }
 
         public void Clear()
         {
+            _lastTitle = "";
+            _lastPct = "0%";
+            _lastBar = 0;
+            _lastTitleMs = 0;
+            _lastTitlePct = -1;
             _title.Text = "";
             _bar.Value = 0;
             _pct.Text = "0%";
         }
+
+        private long _lastTitleMs;
+        private int _lastTitlePct = -1;
     }
 
     private static string? ParseRegion(string? trn)
     {
-        // trn:connect:projects:{location}:{id}
         if (string.IsNullOrWhiteSpace(trn)) return null;
         var parts = trn.Split(':');
         return parts.Length >= 5 ? parts[3] : null;
-    }
-
-    private static string? ParseId(string? trn)
-    {
-        if (string.IsNullOrWhiteSpace(trn)) return null;
-        var parts = trn.Split(':');
-        return parts.Length >= 5 ? parts[4] : null;
     }
 
     private sealed record IntervalItem(string Label, int Minutes)

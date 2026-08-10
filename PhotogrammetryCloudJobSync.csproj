@@ -11,6 +11,7 @@
     <Product>Photogrammetry Cloud Job Sync</Product>
     <AssemblyTitle>Photogrammetry Cloud Job Sync</AssemblyTitle>
     <Company>PhotogrammetryCloudJobSync</Company>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
   <PropertyGroup>

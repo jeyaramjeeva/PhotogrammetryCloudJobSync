@@ -18,8 +18,10 @@ public sealed class SyncService : IAsyncDisposable
     private AuthSession? _session;
     private CancellationTokenSource? _loopCts;
     private CancellationTokenSource? _waitCts;
+    private CancellationTokenSource? _passCts;
     private Task? _loopTask;
     private bool _paused;
+    private bool _cancelRequested;
     private bool _syncNowRequested;
     private int _passNumber;
     private bool _disposed;
@@ -29,6 +31,7 @@ public sealed class SyncService : IAsyncDisposable
     public string? LastPassSummary { get; private set; }
     public DateTimeOffset? LastPassAt { get; private set; }
     public bool IsBusy => State == SyncUiState.Syncing;
+    public bool IsPaused => _paused;
 
     public event Action? Changed;
     public event Action<string>? LogLine;
@@ -74,9 +77,11 @@ public sealed class SyncService : IAsyncDisposable
     public void ApplySettings(
         string environment,
         string outputRoot,
-        string projectTrn,
+        IReadOnlyList<string> projectTrns,
         string selectedRegion,
-        int intervalMinutes)
+        int intervalMinutes,
+        bool includeFailedJobs,
+        IReadOnlyList<string>? includedOutputTypes)
     {
         lock (_gate)
         {
@@ -84,17 +89,28 @@ public sealed class SyncService : IAsyncDisposable
             _config.OutputRoot = outputRoot.Trim();
             _config.SelectedRegion = selectedRegion?.Trim() ?? "";
             _config.WatchIntervalMinutes = Math.Max(1, intervalMinutes);
-            if (!string.IsNullOrWhiteSpace(projectTrn))
-                _config.ProjectTrns = new List<string> { projectTrn.Trim() };
-            else
-                _config.ProjectTrns = new List<string>();
+            _config.IncludeFailedJobs = includeFailedJobs;
+            _config.ProjectTrns = (projectTrns ?? Array.Empty<string>())
+                .Where(p => !string.IsNullOrWhiteSpace(p))
+                .Select(p => p.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            _config.IncludedOutputTypes = (includedOutputTypes ?? Array.Empty<string>())
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Select(t => t.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
             _session?.SetOutputRoot(_config.OutputRoot);
             ConfigStore.SaveUserOverrides(_config);
         }
 
+        var types = _config.IncludedOutputTypes.Count == 0
+            ? "all"
+            : string.Join(", ", _config.IncludedOutputTypes);
         EmitLog($"Settings saved. Env={_config.Environment} Region={_config.SelectedRegion} " +
-                $"every {_config.WatchIntervalMinutes} min → {_config.OutputRoot}");
+                $"projects={_config.ProjectTrns.Count} failedJobs={(_config.IncludeFailedJobs ? "include" : "skip")} " +
+                $"types={types} every {_config.WatchIntervalMinutes} min → {_config.OutputRoot}");
         Changed?.Invoke();
         // Do not cancel wait / trigger sync — only Sync now / Resume starts work.
     }
@@ -175,13 +191,39 @@ public sealed class SyncService : IAsyncDisposable
     public void Pause()
     {
         _paused = true;
-        try { _waitCts?.Cancel(); } catch { /* ignore */ }
-        if (State is SyncUiState.Waiting or SyncUiState.Idle)
-            SetState(SyncUiState.Paused, "Paused");
-        else if (State == SyncUiState.Syncing)
-            EmitLog("Pause requested — will pause after current sync finishes.");
+        _cancelRequested = false;
+        _syncNowRequested = false;
+        var wasSyncing = State == SyncUiState.Syncing;
+        CancelWait();
+        CancelPass();
+        SetState(SyncUiState.Paused, wasSyncing ? "Pausing…" : "Paused");
+        EmitLog(wasSyncing
+            ? "Pause requested — stopping current sync."
+            : "Paused.");
+    }
+
+    /// <summary>Abort the current sync pass and stop the schedule until Sync now / Resume.</summary>
+    public void CancelSync()
+    {
+        if (Session is not { IsLoggedIn: true })
+            return;
+
+        _paused = true;
+        _cancelRequested = true;
+        _syncNowRequested = false;
+        var wasSyncing = State == SyncUiState.Syncing;
+        CancelWait();
+        CancelPass();
+        if (wasSyncing)
+        {
+            SetState(SyncUiState.Idle, "Cancelling…");
+            EmitLog("Cancel requested — aborting current sync.");
+        }
         else
-            SetState(SyncUiState.Paused, "Paused");
+        {
+            SetState(SyncUiState.Idle, "Cancelled");
+            EmitLog("Cancelled.");
+        }
     }
 
     public void Resume()
@@ -193,6 +235,7 @@ public sealed class SyncService : IAsyncDisposable
         }
 
         _paused = false;
+        _cancelRequested = false;
         SetState(SyncUiState.Idle, $"Signed in as {Session.UserDisplay}");
         StartLoop();
         RequestSyncNow();
@@ -200,17 +243,31 @@ public sealed class SyncService : IAsyncDisposable
 
     public void RequestSyncNow()
     {
-        if (Session is not { IsLoggedIn: true })
+        if (State is SyncUiState.NotSignedIn or SyncUiState.AuthFailed
+            || Session is not { IsLoggedIn: true })
         {
             Balloon?.Invoke("Not signed in", "Sign in before syncing.");
+            SetState(SyncUiState.NotSignedIn, "Not signed in — click Sign in");
+            EmitLog("Sync now ignored — sign in required.");
             return;
         }
 
         _paused = false;
+        _cancelRequested = false;
         _syncNowRequested = true;
-        try { _waitCts?.Cancel(); } catch { /* ignore */ }
+        CancelWait();
         StartLoop();
         EmitLog("Sync now requested...");
+    }
+
+    private void CancelWait()
+    {
+        try { _waitCts?.Cancel(); } catch { /* ignore */ }
+    }
+
+    private void CancelPass()
+    {
+        try { _passCts?.Cancel(); } catch { /* ignore */ }
     }
 
     private void StartLoop()
@@ -229,7 +286,8 @@ public sealed class SyncService : IAsyncDisposable
     private void StopLoop()
     {
         try { _loopCts?.Cancel(); } catch { /* ignore */ }
-        try { _waitCts?.Cancel(); } catch { /* ignore */ }
+        CancelWait();
+        CancelPass();
     }
 
     private async Task LoopAsync(CancellationToken ct)
@@ -238,7 +296,10 @@ public sealed class SyncService : IAsyncDisposable
         {
             if (_paused)
             {
-                SetState(SyncUiState.Paused, "Paused");
+                if (_cancelRequested)
+                    SetState(SyncUiState.Idle, "Cancelled");
+                else
+                    SetState(SyncUiState.Paused, "Paused");
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
@@ -312,7 +373,9 @@ public sealed class SyncService : IAsyncDisposable
         try
         {
             session.SetOutputRoot(config.OutputRoot);
-            session.SetAllowInteractiveReLogin(false);
+            // Allow browser re-login if the access token expires during a long pass
+            // (refresh token missing/expired). CDN file downloads can outlive the token.
+            session.SetAllowInteractiveReLogin(true);
             var client = session.CreateClient();
             var downloader = new BatchDownloader(client, config, session)
             {
@@ -320,24 +383,50 @@ public sealed class SyncService : IAsyncDisposable
                 ProgressSink = p => Progress?.Invoke(p)
             };
 
-            var result = await downloader.RunPassAsync(ct).ConfigureAwait(false);
-            LastPassAt = DateTimeOffset.Now;
-            LastPassSummary =
-                $"Last sync {LastPassAt:HH:mm} — downloaded {result.Downloaded}, skipped {result.SkippedExisting}, " +
-                $"waiting {result.SkippedNotReady}, failed {result.Failed}, errors {result.Errors}";
-            EmitLog(LastPassSummary);
-            SetState(SyncUiState.Idle, LastPassSummary);
+            using var passCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _passCts = passCts;
+            try
+            {
+                var result = await downloader.RunPassAsync(passCts.Token).ConfigureAwait(false);
+                LastPassAt = DateTimeOffset.Now;
+                LastPassSummary =
+                    $"Last sync {LastPassAt:HH:mm} — downloaded {result.Downloaded}, skipped {result.SkippedExisting}, " +
+                    $"waiting {result.SkippedNotReady}, failed {result.Failed}, errors {result.Errors}";
+                EmitLog(LastPassSummary);
+                SetState(SyncUiState.Idle, LastPassSummary);
+            }
+            finally
+            {
+                session.SetAllowInteractiveReLogin(false);
+                if (ReferenceEquals(_passCts, passCts))
+                    _passCts = null;
+            }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            SetState(SyncUiState.Idle, "Cancelled");
+            Progress?.Invoke(SyncProgress.Idle("Sync stopped"));
+            if (!_paused)
+                return; // Resume / Sync now already requested while aborting
+
+            if (_cancelRequested)
+            {
+                SetState(SyncUiState.Idle, "Cancelled");
+                EmitLog("Sync cancelled.");
+            }
+            else
+            {
+                SetState(SyncUiState.Paused, "Paused");
+                EmitLog("Sync paused.");
+            }
         }
         catch (AuthExpiredException ex)
         {
             EmitLog("AUTH STOPPED: " + ex.Message);
-            SetState(SyncUiState.AuthFailed, "Session expired — sign in again");
-            Balloon?.Invoke("Session expired", "Sign in again to continue syncing.");
+            _paused = true;
+            _syncNowRequested = false;
             try { await session.SignOutAsync().ConfigureAwait(false); } catch { /* ignore */ }
+            SetState(SyncUiState.NotSignedIn, "Session expired — sign in again");
+            Balloon?.Invoke("Session expired", "Sign in again, then click Sync now.");
         }
         catch (Exception ex)
         {
@@ -355,6 +444,7 @@ public sealed class SyncService : IAsyncDisposable
         ProjectTrns = (c.ProjectTrns ?? new List<string>()).ToList(),
         SelectedRegion = c.SelectedRegion,
         IncludeFailedJobs = c.IncludeFailedJobs,
+        IncludedOutputTypes = (c.IncludedOutputTypes ?? new List<string>()).ToList(),
         MaxConcurrentJobs = c.MaxConcurrentJobs,
         MaxConcurrentFileDownloads = c.MaxConcurrentFileDownloads,
         VerifyAndRepairMissingFiles = c.VerifyAndRepairMissingFiles,

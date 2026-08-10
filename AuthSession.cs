@@ -9,6 +9,7 @@ public sealed class AuthSession : IAsyncDisposable
 {
     private readonly LocalhostAuthenticator _authenticator;
     private readonly FileTokenStorage _storage;
+    private readonly SemaphoreSlim _loginGate = new(1, 1);
     private string _outputRoot;
     private bool _allowInteractiveReLogin;
     private bool? _paidUserHint;
@@ -47,6 +48,7 @@ public sealed class AuthSession : IAsyncDisposable
 
         var scopeList = new List<string> { "PhotogrammetryAPI" };
         scopeList.AddRange(scopes.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        // offline_access is requested via WithOfflineAccess() below (same as Trimble.ID intended usage).
 
         var storage = new FileTokenStorage("PhotogrammetryAPI", storageSuffix);
         var authenticator = new LocalhostAuthenticator(
@@ -147,80 +149,90 @@ public sealed class AuthSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Call before each sync pass. Uses refresh token when possible.
-    /// Opens browser only if AllowInteractiveReLogin is true.
+    /// Call before each sync pass / API burst. Uses refresh token when possible.
+    /// Opens browser only if AllowInteractiveReLogin is true (serialized — one browser at a time).
     /// Throws <see cref="AuthExpiredException"/> if login cannot be recovered.
     /// </summary>
     public async Task EnsureAuthenticatedAsync(CancellationToken ct, string? reason = null)
     {
+        if (await TryExistingTokenAsync().ConfigureAwait(false))
+            return;
+
+        // Try silent refresh from persisted offline_access token (do not clear storage yet).
         try
         {
-            var token = await TokenProvider.RetrieveToken().ConfigureAwait(false);
-            if (!string.IsNullOrWhiteSpace(token))
+            WriteLog($"Trying to refresh saved login{(reason is null ? "" : $" ({reason})")}...");
+            var cached = await _authenticator.LoadCachedLogin().ConfigureAwait(false);
+            if (cached && _authenticator.IsLoggedIn
+                && await TryExistingTokenAsync().ConfigureAwait(false))
             {
-                ClearAlertFile(_outputRoot);
+                await RefreshUserInfoAsync().ConfigureAwait(false);
+                WriteLog("Login refreshed successfully from saved credentials.");
                 return;
             }
 
-            throw new InvalidOperationException("Access token is empty.");
-        }
-        catch (AuthExpiredException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            WriteLog($"Auth check failed{(reason is null ? "" : $" ({reason})")}: {ex.Message}");
-        }
-
-        try
-        {
-            WriteLog("Trying to refresh saved login...");
-            var cached = await _authenticator.LoadCachedLogin().ConfigureAwait(false);
-            if (cached && _authenticator.IsLoggedIn)
-            {
-                var token = await TokenProvider.RetrieveToken().ConfigureAwait(false);
-                if (!string.IsNullOrWhiteSpace(token))
-                {
-                    await RefreshUserInfoAsync().ConfigureAwait(false);
-                    WriteLog("Login refreshed successfully from saved credentials.");
-                    ClearAlertFile(_outputRoot);
-                    return;
-                }
-            }
+            WriteLog("Saved login refresh failed: no usable access token.");
         }
         catch (Exception ex)
         {
             WriteLog($"Saved login refresh failed: {ex.Message}");
-            _storage.Clear();
-            UserDisplay = null;
         }
 
         if (_allowInteractiveReLogin)
         {
-            WriteLog("Opening browser for re-login...");
+            await _loginGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                await SignInInternalAsync(forceBrowser: true, ct).ConfigureAwait(false);
-                ClearAlertFile(_outputRoot);
-                WriteLog("Re-login successful.");
-                return;
+                // Another parallel caller may have finished login while we waited.
+                if (await TryExistingTokenAsync().ConfigureAwait(false))
+                    return;
+
+                WriteLog("Opening browser for re-login...");
+                try
+                {
+                    await SignInInternalAsync(forceBrowser: true, ct).ConfigureAwait(false);
+                    ClearAlertFile(_outputRoot);
+                    WriteLog("Re-login successful.");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    WriteAlertFile(_outputRoot, "Interactive re-login failed: " + ex.Message);
+                    throw new AuthExpiredException(
+                        "Login expired and interactive re-login failed.",
+                        ex);
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                WriteAlertFile(_outputRoot, "Interactive re-login failed: " + ex.Message);
-                throw new AuthExpiredException(
-                    "Login expired and interactive re-login failed.",
-                    ex);
+                _loginGate.Release();
             }
         }
 
         WriteAlertFile(_outputRoot,
-            "Login/refresh token expired or was revoked.\n" +
+            "Login/refresh token expired or was revoked (or offline_access was not granted).\n" +
+            "Long downloads can outlive the access token; without a refresh token sync must stop.\n" +
             $"Sync stopped. Use Sign in in {AppInfo.DisplayName} to continue.");
         throw new AuthExpiredException(
             "Login expired and cannot be refreshed automatically. " +
             $"See {Path.Combine(_outputRoot, AlertFileName)}.");
+    }
+
+    private async Task<bool> TryExistingTokenAsync()
+    {
+        try
+        {
+            var token = await TokenProvider.RetrieveToken().ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(token))
+                return false;
+            ClearAlertFile(_outputRoot);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"Auth check failed: {ex.Message}");
+            return false;
+        }
     }
 
     public PhotogrammetryClient CreateClient()
@@ -297,11 +309,35 @@ public sealed class AuthSession : IAsyncDisposable
                 throw new InvalidOperationException("Sign-in failed or was cancelled.");
 
             _ = await TokenProvider.RetrieveToken().ConfigureAwait(false);
-            WriteLog("Sign-in successful. Refresh token saved.");
+            WriteLog("Sign-in successful.");
         }
 
+        await LogRefreshTokenStatusAsync().ConfigureAwait(false);
         await RefreshUserInfoAsync().ConfigureAwait(false);
         WriteLog($"User: {UserDisplay ?? "(unknown)"}");
+    }
+
+    private async Task LogRefreshTokenStatusAsync()
+    {
+        try
+        {
+#pragma warning disable CS0618 // LegacyTokenProvider is the supported way to read the refresh token
+            var refresh = await _authenticator.LegacyTokenProvider.RetrieveRefreshToken().ConfigureAwait(false);
+#pragma warning restore CS0618
+            if (!string.IsNullOrWhiteSpace(refresh))
+            {
+                WriteLog("Refresh token saved — long downloads can renew login automatically.");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"Could not read refresh token ({ex.Message}).");
+        }
+
+        WriteLog(
+            "WARNING: No refresh token after sign-in. Access token will expire during long syncs; " +
+            "you may need to Sign in again between jobs. (Trimble ID client may not grant offline_access.)");
     }
 
     private async Task RefreshUserInfoAsync()
@@ -370,6 +406,7 @@ public sealed class AuthSession : IAsyncDisposable
     public ValueTask DisposeAsync()
     {
         _authenticator.Dispose();
+        _loginGate.Dispose();
         return ValueTask.CompletedTask;
     }
 
